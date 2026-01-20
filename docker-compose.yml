@@ -1,0 +1,35 @@
+version: "3.9"
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+
+  proxy:
+    build:
+      context: .
+      dockerfile: ./Dockerfile.proxy
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - PER_ID_RPS=20
+      - PER_ID_BURST=30
+      - GLOBAL_RPS=100
+      - GLOBAL_BURST=80
+      - ROTATION_BACKOFF_MS=30000
+      - ROTATION_BACKOFF_MAX_MS=300000
+      - PORT=8080
+    depends_on:
+      - redis
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+
+
