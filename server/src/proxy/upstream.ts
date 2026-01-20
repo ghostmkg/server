@@ -4,14 +4,13 @@ import { SessionStore, Cookie } from '../store/sessionStore';
 import * as https from 'https';
 import { URL } from 'url';
 
-// 1. GLOBAL AGENT (TUNED FOR SWARM SPEED)
+// 1. GLOBAL AGENT (CRITICAL FOR SPEED)
 const httpsAgent = new https.Agent({
   keepAlive: true,
-  keepAliveMsecs: 500, // Aggressive keep-alive
+  keepAliveMsecs: 1000,
   maxSockets: Infinity,
-  maxFreeSockets: 500, // Keep more sockets open for the swarm
-  timeout: 30000,
-  scheduling: 'lifo' // Last In First Out usually gives warmer sockets
+  maxFreeSockets: 256,
+  timeout: 30000
 });
 
 function serializeCookies(cookies: Cookie[], domain: string): string {
@@ -38,27 +37,31 @@ export function createUpstreamForwarder(sessionStore: SessionStore) {
     try {
       const session = req.ctx!.candidate!.session;
       
-      // --- DYNAMIC ROUTING LOGIC ---
+      // --- CRITICAL FIX: DYNAMIC ROUTING LOGIC ---
       let targetHost = 'hiring.amazon.com'; // Default to US
       
+      // 1. Check if extension explicitly requested a domain (Reliable)
       const explicitDomain = req.headers['x-target-domain'];
       if (typeof explicitDomain === 'string' && explicitDomain.includes('amazon')) {
           targetHost = explicitDomain;
       } 
+      // 2. Fallback: Detect from path or host header
       else if (req.path.includes('/application/ca/') || req.headers['host']?.includes('.ca')) {
           targetHost = 'hiring.amazon.ca';
       }
 
+      // Construct Target URL
       const targetUrl = new URL(`https://${targetHost}${req.originalUrl}`);
 
       // Prepare headers
       const headers: Record<string, string> = {};
-      const safeHeaders = ['content-type', 'accept', 'accept-language', 'user-agent', 'x-requested-with', 'origin', 'referer', 'x-worker-id'];
+      const safeHeaders = ['content-type', 'accept', 'accept-language', 'user-agent', 'x-requested-with', 'origin', 'referer'];
       
       safeHeaders.forEach(h => {
         if (req.headers[h]) headers[h] = req.headers[h] as string;
       });
 
+      // Inject Auth & Cookies
       if (session.accessToken) headers['Authorization'] = session.accessToken;
       if (session.cookies) headers['Cookie'] = serializeCookies(session.cookies, targetHost);
       if (session.csrf) headers['X-Csrf-Token'] = session.csrf;
@@ -70,18 +73,18 @@ export function createUpstreamForwarder(sessionStore: SessionStore) {
         method: req.method,
         headers: headers,
         agent: httpsAgent,
-        timeout: 10000 // Tight timeout to fail fast and retry
+        timeout: 15000
       };
 
       await new Promise<void>((resolve) => {
         const upstreamReq = https.request(options, (upstreamRes) => {
           if (upstreamRes.statusCode === 429) {
-            // Log 429s but don't panic - the swarm handles retries
-            // console.warn(`[${candidateId}] 429 on ${targetHost}`); 
+            console.warn(`[${candidateId}] Upstream 429 Rate Limit`);
             if (!res.headersSent) {
               res.status(429).json({
                 error: 'upstream_rate_limit',
-                retryAfter: upstreamRes.headers['retry-after'] || '2'
+                message: 'Amazon upstream rate limited',
+                retryAfter: upstreamRes.headers['retry-after'] || '5'
               });
             }
             upstreamRes.resume();
@@ -100,8 +103,8 @@ export function createUpstreamForwarder(sessionStore: SessionStore) {
         });
 
         upstreamReq.on('error', (err: any) => {
-          console.error(`[${candidateId}] Connection Error:`, err.message);
-          if (!res.headersSent) res.status(502).json({ error: 'upstream_failed' });
+          console.error(`[${candidateId}] Connection Error to ${targetHost}:`, err.message);
+          if (!res.headersSent) res.status(502).json({ error: 'upstream_failed', message: err.message });
           resolve();
         });
 

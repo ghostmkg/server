@@ -1,7 +1,7 @@
 // filepath: server/src/routes/proxy.ts
 import { Router, Request, Response, NextFunction } from 'express';
 import { createCandidateContextMiddleware } from '../mw/candidateContext';
-import { createUpstreamForwarder } from '../proxy/upstream'; // Updated path
+import { createUpstreamForwarder } from '../proxy/upstream';
 import { RateLimiter } from '../rate/limiter';
 import { SessionStore } from '../store/sessionStore';
 
@@ -24,6 +24,7 @@ export function createProxyRouter(
     if (!perIdResult.ok) {
       return res.status(429).json({
         error: 'rate_limited',
+        message: 'Per-candidate rate limit exceeded',
         retryAfter: perIdResult.retryAfterMs
       });
     }
@@ -33,43 +34,55 @@ export function createProxyRouter(
     if (!globalResult.ok) {
       return res.status(429).json({
         error: 'rate_limited',
-        message: 'Global limit',
+        message: 'Global rate limit exceeded',
         retryAfter: globalResult.retryAfterMs
       });
     }
     next();
   };
 
-  // --- MANUAL VALIDATION ---
+  // --- MANUAL VALIDATION (No Library Required) ---
   
-  const validateCreateApp = (req: Request, res: Response, next: NextFunction) => {
-      // Debug log to see which worker is active
-      const workerId = req.headers['x-worker-id'] || 'unknown';
-      console.log(`📝 Create App | Worker: ${workerId} | Job: ${req.body?.jobId}`); 
+  router.post(
+    '/application/api/candidate-application/ds/create-application',
+    (req: Request, res: Response, next: NextFunction) => {
+      console.log('📝 Create App Request (New Code Loaded)'); // Debug log
       
       const errors = [];
       if (!req.body?.jobId) errors.push({ param: 'jobId', msg: 'Job ID is required' });
       if (!req.body?.scheduleId) errors.push({ param: 'scheduleId', msg: 'Schedule ID is required' });
 
-      if (errors.length > 0) return res.status(400).json({ errors });
+      if (errors.length > 0) {
+        return res.status(400).json({ errors });
+      }
       next();
-  };
+    },
+    candidateContext,
+    rateLimitMiddleware,
+    forwardWithJar
+  );
 
-  const validateUpdateApp = (req: Request, res: Response, next: NextFunction) => {
+  router.put(
+    '/application/api/candidate-application/update-application',
+    (req: Request, res: Response, next: NextFunction) => {
       const errors = [];
       if (!req.body?.applicationId) errors.push({ param: 'applicationId', msg: 'Application ID is required' });
       
+      // Handle nested payload safely
       const payload = req.body?.payload || {};
       if (!payload.jobId) errors.push({ param: 'payload.jobId', msg: 'Job ID is required' });
       if (!payload.scheduleId) errors.push({ param: 'payload.scheduleId', msg: 'Schedule ID is required' });
 
-      if (errors.length > 0) return res.status(400).json({ errors });
+      if (errors.length > 0) {
+        return res.status(400).json({ errors });
+      }
       next();
-  };
+    },
+    candidateContext,
+    rateLimitMiddleware,
+    forwardWithJar
+  );
 
-  router.post('/application/api/candidate-application/ds/create-application', validateCreateApp, candidateContext, rateLimitMiddleware, forwardWithJar);
-  router.put('/application/api/candidate-application/update-application', validateUpdateApp, candidateContext, rateLimitMiddleware, forwardWithJar);
-  
   // Catch-all
   router.all('/application/api/*', candidateContext, rateLimitMiddleware, forwardWithJar);
 
