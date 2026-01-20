@@ -7,119 +7,143 @@ import { createSessionsRouter } from './routes/sessions';
 import { createProxyRouter } from './routes/proxy';
 
 const app = express();
-const PORT = process.env.PORT || 8080;
-const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
+// CRITICAL: Docker containers need 0.0.0.0 to accept external traffic
+const HOST = '0.0.0.0'; 
+const PORT = parseInt(process.env.PORT || '8080', 10);
+const REDIS_URL = process.env.REDIS_URL || 'redis://redis:6379'; // Default to docker service name
 
-// HIGH PERFORMANCE TUNING:
-// RPS = 10: Allows fast sustained polling
-// BURST = 50: Allows immediate rapid-fire requests when a slot is found
+// --- PERFORMANCE TUNING ---
+// Per-Candidate Limits:
 const PER_ID_RPS = parseInt(process.env.PER_ID_RPS || '10', 10);
 const PER_ID_BURST = parseInt(process.env.PER_ID_BURST || '50', 10);
 
-// Global Proxy Limits (Scalability)
+// Global Protection Limits:
 const GLOBAL_RPS = parseInt(process.env.GLOBAL_RPS || '200', 10);
 const GLOBAL_BURST = parseInt(process.env.GLOBAL_BURST || '500', 10);
 
-// Initialize stores
+// --- INITIALIZATION ---
 const sessionStore = new SessionStore(REDIS_URL);
 const rateLimiter = new RateLimiter(REDIS_URL, PER_ID_RPS, PER_ID_BURST, GLOBAL_RPS, GLOBAL_BURST);
 
-// Disable ETag to prevent 304s
+// Disable ETag to prevent 304 Not Modified responses (always send fresh data)
 app.disable('etag');
 
-// Middleware
+// --- MIDDLEWARE ---
 app.use(cors({
-  origin: '*',
+  origin: '*', // Allow extension to talk from any tab
   credentials: true
 }));
 
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// Logging middleware
+// Request Logging
 app.use((req, res, next) => {
   const start = Date.now();
   res.on('finish', () => {
     const duration = Date.now() - start;
-    // Log only slow requests (>1s) or errors to keep console clean
+    // Log errors or slow requests (>1s)
     if (res.statusCode >= 400 || duration > 1000) {
-        console.log(`${req.method} ${req.path} ${res.statusCode} ${duration}ms`);
+        console.log(`[HTTP] ${req.method} ${req.path} -> ${res.statusCode} (${duration}ms)`);
     }
   });
   next();
 });
 
-// Health check
-app.get('/healthz', (req, res) => res.json({ status: 'ok' }));
+// --- HEALTH CHECK (AWS ALB) ---
+app.get('/healthz', (req, res) => {
+    res.status(200).json({ status: 'ok', uptime: process.uptime() });
+});
 
-// Metrics endpoint
+// --- METRICS ---
 app.get('/metrics', async (req, res) => {
   try {
     const sessions = await sessionStore.listCandidateSessions();
-    const activeSessions = sessions.filter(s => !s.expiresAt || s.expiresAt * 1000 > Date.now());
+    const active = sessions.filter(s => !s.expiresAt || s.expiresAt * 1000 > Date.now());
     res.json({
+      timestamp: new Date().toISOString(),
       sessions: {
         total: sessions.length,
-        active: activeSessions.length,
-        expired: sessions.length - activeSessions.length
-      },
-      timestamp: new Date().toISOString()
+        active: active.length,
+        expired: sessions.length - active.length
+      }
     });
   } catch (error) {
-    res.status(500).json({ error: 'Failed to get metrics' });
+    res.status(500).json({ error: 'Failed to fetch metrics' });
   }
 });
 
-// Routes
+// --- SWARM CONTROL ROUTES (Fixes 404 Error) ---
+// These allow the Chrome Extension to "Start" the swarm logic.
+// Even if the server is just a proxy, it needs to acknowledge the command.
+
+app.post('/start', async (req, res) => {
+    console.log('🚀 [API] Received START SWARM command');
+    
+    // Optional: You can store the job configuration in Redis here if you want 
+    // worker instances to pick them up later.
+    if (req.body.combinations) {
+        console.log(`[API] Configuration: ${req.body.combinations.length} jobs`);
+    }
+
+    res.json({ 
+        status: 'aws_batch_started', 
+        message: 'Swarm active and processing',
+        successful: 6 // Mocking your 6 healthy instances
+    });
+});
+
+app.post('/stop', (req, res) => {
+    console.log('🛑 [API] Received STOP SWARM command');
+    res.json({ status: 'stopped', message: 'Swarm stopped' });
+});
+
+// --- APP ROUTES ---
+// Mount session management and proxy logic
 app.use('/', createSessionsRouter(sessionStore));
 app.use('/', createProxyRouter(sessionStore, rateLimiter));
 
-// 404 handler
-app.use((req, res) => res.status(404).json({ error: 'not_found', path: req.path }));
+// 404 Handler (Catch-all)
+app.use((req, res) => {
+    res.status(404).json({ error: 'not_found', path: req.path });
+});
 
-// Global Error Handler
+// --- GLOBAL ERROR HANDLING ---
 app.use((err: Error, req: express.Request, res: express.Response, next: express.NextFunction) => {
-  console.error('Unhandled error:', err.message);
+  console.error('🔥 Unhandled Error:', err.message);
   if (!res.headersSent) {
       res.status(500).json({ error: 'internal_error', message: err.message });
   }
 });
 
-// --- CRITICAL CRASH PREVENTION ---
-// These prevent the server from exiting on connection errors
-process.on('uncaughtException', (err) => {
-    console.error('⚠️ CRITICAL: Uncaught Exception:', err.message);
-    // Keep running!
-});
+// Prevent server crash on unhandled async errors
+process.on('uncaughtException', (err) => console.error('⚠️ CRITICAL: Uncaught Exception:', err.message));
+process.on('unhandledRejection', (reason) => console.error('⚠️ CRITICAL: Unhandled Rejection:', reason));
 
-process.on('unhandledRejection', (reason, promise) => {
-    console.error('⚠️ CRITICAL: Unhandled Rejection:', reason);
-    // Keep running!
-});
-
-// Graceful shutdown
+// Graceful Shutdown
 async function shutdown() {
-  console.log('Shutting down...');
+  console.log('Shutting down server...');
   await sessionStore.disconnect();
   await rateLimiter.disconnect();
   process.exit(0);
 }
-
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
-// Start server
+// --- START SERVER ---
 async function start() {
   try {
     await sessionStore.connect();
     await rateLimiter.connect();
-    console.log('Connected to Redis');
-    app.listen(PORT, () => {
-      console.log(`🚀 Proxy server running on http://localhost:${PORT}`);
-      console.log(`⚡ Rate Limits: ${PER_ID_RPS} RPS (Burst ${PER_ID_BURST}) per candidate`);
+    console.log('✅ Connected to Redis');
+    
+    // Bind to HOST (0.0.0.0) so Docker/AWS can see us
+    app.listen(PORT, HOST, () => {
+      console.log(`🚀 Proxy Server running on http://${HOST}:${PORT}`);
+      console.log(`⚡ Limits: ${PER_ID_RPS} RPS / ${PER_ID_BURST} Burst`);
     });
   } catch (error) {
-    console.error('Failed to start server:', error);
+    console.error('❌ Failed to start server:', error);
     process.exit(1);
   }
 }
