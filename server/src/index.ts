@@ -4,7 +4,7 @@ import cors from 'cors';
 import fetch from 'node-fetch'; 
 import { SessionStore } from './store/sessionStore';
 import { RateLimiter } from './rate/limiter';
-import { JobQueue } from './store/queue'; // Import the new Queue class
+import { JobQueue } from './store/queue'; 
 import { createSessionsRouter } from './routes/sessions';
 import { createProxyRouter } from './routes/proxy';
 
@@ -22,9 +22,10 @@ const GLOBAL_BURST = parseInt(process.env.GLOBAL_BURST || '500', 10);
 // --- INITIALIZATION ---
 const sessionStore = new SessionStore(REDIS_URL);
 const rateLimiter = new RateLimiter(REDIS_URL, PER_ID_RPS, PER_ID_BURST, GLOBAL_RPS, GLOBAL_BURST);
-const jobQueue = new JobQueue(REDIS_URL); // Initialize Queue
+const jobQueue = new JobQueue(REDIS_URL); 
 
 // --- WORKER CLASS ---
+// This class runs the actual job loop for a specific candidate + job combination
 class JobWorker {
     private active = true;
 
@@ -39,18 +40,74 @@ class JobWorker {
     }
 
     async startLoop() {
-        // console.log(`[Worker] 🟢 Starting ${this.candidateId.slice(-4)} on ${this.jobId}`);
         const domain = this.jobId.includes('JOB-US') ? 'hiring.amazon.com' : 'hiring.amazon.ca';
-        
+        const countryCode = this.jobId.includes('JOB-US') ? 'US' : 'CA';
+
+        // console.log(`[Worker] 🟢 Started: ${this.candidateId.slice(0,8)}... on ${this.jobId}`);
+
         while (this.active) {
             try {
-                // ... Your existing logic (create/update app) ...
-                // Adding a random delay to prevent all 6 instances hitting API at exact same millisecond
-                await new Promise(r => setTimeout(r, 2000 + Math.random() * 1000));
+                // 1. CREATE APPLICATION
+                const createRes = await fetch(`https://${domain}/application/api/candidate-application/ds/create-application/`, {
+                    method: 'POST',
+                    headers: {
+                        'content-type': 'application/json',
+                        'x-candidate-id': this.candidateId,
+                        'cookie': this.cookies,
+                        'authorization': this.authToken,
+                        'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                    },
+                    body: JSON.stringify({
+                        jobId: this.jobId,
+                        scheduleId: this.scheduleId,
+                        candidateId: this.candidateId,
+                        dspEnabled: true,
+                        activeApplicationCheckEnabled: true
+                    })
+                });
+
+                if (createRes.status === 200) {
+                    const data: any = await createRes.json();
+                    const appId = data.data?.applicationId;
+                    
+                    if (appId) {
+                        console.log(`[Worker] ✅ App Created: ${appId} for ${this.candidateId.slice(0,5)}`);
+                        // 2. UPDATE APPLICATION (Confirm)
+                        await this.updateApplication(domain, appId);
+                    }
+                } else if (createRes.status === 429) {
+                    // Backoff on rate limit
+                    await new Promise(r => setTimeout(r, 5000));
+                }
+
+                // Polling Interval + Jitter (to prevent thundering herd)
+                await new Promise(r => setTimeout(r, 2000 + Math.random() * 1500));
+
             } catch (err) {
+                console.error(`[Worker] Error:`, err);
                 await new Promise(r => setTimeout(r, 5000));
             }
         }
+    }
+
+    async updateApplication(domain: string, applicationId: string) {
+         try {
+            await fetch(`https://${domain}/application/api/candidate-application/update-application`, {
+                method: "PUT",
+                headers: {
+                    'content-type': 'application/json',
+                    'x-candidate-id': this.candidateId,
+                    'cookie': this.cookies,
+                    'authorization': this.authToken
+                },
+                body: JSON.stringify({
+                    applicationId,
+                    candidateId: this.candidateId,
+                    payload: { jobId: this.jobId, scheduleId: this.scheduleId },
+                    type: "job-confirm", isCsRequest: true
+                })
+            });
+         } catch(e) {}
     }
 
     stop() {
@@ -58,20 +115,20 @@ class JobWorker {
     }
 }
 
-// Local array to track what THIS instance is running
+// Local array to track what THIS specific instance is running
 const localWorkers: JobWorker[] = [];
 
-// --- CONSUMER LOOP (The Magic Part) ---
-// This runs on EVERY instance. It constantly checks Redis for new work.
+// --- CONSUMER LOOP ---
+// Runs on EVERY instance. Checks Redis for work.
 async function startTaskConsumer() {
-    console.log('👀 specific instance started watching for work...');
+    console.log('👀 Worker Node started. Watching queue...');
     
     setInterval(async () => {
-        // 1. Try to steal a task from Redis
+        // Try to steal a task from Redis
         const taskData = await jobQueue.getNextTask();
         
         if (taskData) {
-            console.log(`[Consumer] ⚡ Picked up task for ${taskData.candidateId}`);
+            console.log(`[Consumer] ⚡ Taken task: ${taskData.jobId} for ${taskData.candidateId.slice(0,5)}`);
             
             const worker = new JobWorker(
                 taskData.jobId,
@@ -82,58 +139,112 @@ async function startTaskConsumer() {
             );
             localWorkers.push(worker);
         }
-    }, 1000); // Check every second (or faster if you want)
+    }, 1000); // Check every second
 }
 
 
+// --- MIDDLEWARE ---
 app.disable('etag');
 app.use(cors({ origin: '*', credentials: true }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// Health Check
+// Logging
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    if (res.statusCode >= 400 || duration > 1000) {
+        console.log(`[HTTP] ${req.method} ${req.path} -> ${res.statusCode} (${duration}ms)`);
+    }
+  });
+  next();
+});
+
+// --- HEALTH CHECKS ---
 app.get('/healthz', (req, res) => res.status(200).json({ status: 'ok', uptime: process.uptime() }));
 app.get('/', (req, res) => res.status(200).send('OK')); 
 
 // --- API ROUTES ---
 
 app.post('/start', async (req, res) => {
-    console.log('🚀 [API] Received START command (Manager Role)');
-    
-    // NOTE: Extension now sends an ARRAY of sessions (candidates) and combinations
-    const { combinations, sessions } = req.body;
+    console.log('🚀 [API] Received START command');
 
-    // Validation
-    if (!sessions || !Array.isArray(sessions) || !combinations) {
-        return res.status(400).json({ status: 'failed', message: 'Invalid payload: Need sessions array and combinations' });
+    // --- 1. DYNAMIC INPUT NORMALIZATION ---
+    // Always convert inputs to Arrays, handling legacy single-item format
+
+    // Handle "Sessions" (Accounts)
+    let sessions = [];
+    if (Array.isArray(req.body.sessions) && req.body.sessions.length > 0) {
+        sessions = req.body.sessions; 
+    } else if (req.body.candidateId && req.body.authToken) {
+        // Fallback: Single account
+        sessions.push({
+            candidateId: req.body.candidateId,
+            authToken: req.body.authToken,
+            cookieHeader: req.body.cookieHeader
+        });
     }
 
-    // 1. Generate ALL Tasks (Cross Product: 24 candidates * 8 jobs = 192 Tasks)
+    // Handle "Combinations" (Jobs)
+    let jobs = [];
+    if (Array.isArray(req.body.combinations) && req.body.combinations.length > 0) {
+        jobs = req.body.combinations;
+    } else if (req.body.jobId && req.body.scheduleId) {
+        // Fallback: Single job
+        jobs.push({
+            jobId: req.body.jobId,
+            scheduleId: req.body.scheduleId
+        });
+    }
+
+    // --- 2. VALIDATION ---
+    if (sessions.length === 0 || jobs.length === 0) {
+        return res.status(400).json({ 
+            status: 'failed', 
+            message: `Invalid Input. Found ${sessions.length} accounts and ${jobs.length} jobs.` 
+        });
+    }
+
+    // --- 3. GENERATE TASKS (Cross-Product) ---
     const allTasks = [];
     
     for (const session of sessions) {
-        // Assume session object has { candidateId, authToken, cookieHeader }
-        for (const job of combinations) {
-            if (job.jobId && job.scheduleId) {
-                allTasks.push({
-                    jobId: job.jobId,
-                    scheduleId: job.scheduleId,
-                    candidateId: session.candidateId,
-                    authToken: session.authToken || req.body.authToken, // Fallback if token is global
-                    cookieHeader: session.cookieHeader || req.body.cookieHeader
-                });
-            }
+        if (!session.candidateId || !session.authToken) continue;
+
+        for (const job of jobs) {
+            if (!job.jobId || !job.scheduleId) continue;
+
+            allTasks.push({
+                jobId: job.jobId,
+                scheduleId: job.scheduleId,
+                candidateId: session.candidateId,
+                authToken: session.authToken,
+                cookieHeader: session.cookieHeader || ""
+            });
         }
     }
 
-    // 2. Push to Redis (All 6 instances will start grabbing these)
-    await jobQueue.addTasks(allTasks);
+    // --- 4. DISTRIBUTE TO WORKERS ---
+    if (allTasks.length > 0) {
+        // Push to Redis. All instances (including this one) will start grabbing tasks.
+        await jobQueue.addTasks(allTasks);
+        
+        console.log(`[Manager] Distributed ${allTasks.length} tasks.`);
 
-    res.json({ 
-        status: 'aws_batch_started', 
-        message: `Distributed ${allTasks.length} tasks to swarm`,
-        successful: 6 
-    });
+        res.json({ 
+            status: 'aws_batch_started', 
+            message: `Swarm started. Distributed ${allTasks.length} tasks across the grid.`,
+            successful: 6, // Number of instances (static for now)
+            details: {
+                accounts: sessions.length,
+                jobs: jobs.length,
+                totalTasks: allTasks.length
+            }
+        });
+    } else {
+        res.status(400).json({ status: 'failed', message: "No valid tasks could be generated." });
+    }
 });
 
 app.post('/stop', async (req, res) => {
@@ -147,13 +258,18 @@ app.post('/stop', async (req, res) => {
 app.use('/', createSessionsRouter(sessionStore));
 app.use('/', createProxyRouter(sessionStore, rateLimiter));
 
+// Error Handling
+app.use((err: Error, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  console.error('🔥 Unhandled Error:', err.message);
+  if (!res.headersSent) res.status(500).json({ error: 'internal_error', message: err.message });
+});
 
 // --- SETUP & START ---
 async function start() {
   try {
     await sessionStore.connect();
     await rateLimiter.connect();
-    await jobQueue.connect(); // Connect to Queue
+    await jobQueue.connect(); 
     
     // 1. Start the Consumer Loop immediately
     startTaskConsumer();
