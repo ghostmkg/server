@@ -1,7 +1,6 @@
 // filepath: server/src/index.ts
 import express from 'express';
 import cors from 'cors';
-import fetch from 'node-fetch'; 
 import { SessionStore } from './store/sessionStore';
 import { RateLimiter } from './rate/limiter';
 import { JobQueue } from './store/queue'; 
