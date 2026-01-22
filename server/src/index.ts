@@ -1,6 +1,7 @@
 // filepath: server/src/index.ts
 import express from 'express';
 import cors from 'cors';
+// import fetch from 'node-fetch'; // REMOVED: Using Node 18 global fetch
 import { SessionStore } from './store/sessionStore';
 import { RateLimiter } from './rate/limiter';
 import { JobQueue } from './store/queue'; 
@@ -40,10 +41,7 @@ class JobWorker {
 
     async startLoop() {
         const domain = this.jobId.includes('JOB-US') ? 'hiring.amazon.com' : 'hiring.amazon.ca';
-        const countryCode = this.jobId.includes('JOB-US') ? 'US' : 'CA';
-
-        // console.log(`[Worker] 🟢 Started: ${this.candidateId.slice(0,8)}... on ${this.jobId}`);
-
+        
         while (this.active) {
             try {
                 // 1. CREATE APPLICATION
@@ -70,20 +68,29 @@ class JobWorker {
                     const appId = data.data?.applicationId;
                     
                     if (appId) {
-                        console.log(`[Worker] ✅ App Created: ${appId} for ${this.candidateId.slice(0,5)}`);
+                        const msg = `✅ App Created: ${appId} for ${this.candidateId.slice(0,5)}`;
+                        console.log(`[Worker] ${msg}`);
+                        
+                        // 🔥 BROADCAST SUCCESS LOG
+                        jobQueue.publishLog(JSON.stringify({ type: 'success', msg }));
+
                         // 2. UPDATE APPLICATION (Confirm)
                         await this.updateApplication(domain, appId);
                     }
                 } else if (createRes.status === 429) {
-                    // Backoff on rate limit
                     await new Promise(r => setTimeout(r, 5000));
                 }
 
-                // Polling Interval + Jitter (to prevent thundering herd)
+                // Polling Interval + Jitter
                 await new Promise(r => setTimeout(r, 2000 + Math.random() * 1500));
 
-            } catch (err) {
-                console.error(`[Worker] Error:`, err);
+            } catch (err: any) {
+                const msg = `❌ Error on ${this.candidateId.slice(0,5)}: ${err.message}`;
+                console.error(`[Worker] ${msg}`);
+                
+                // 🔥 BROADCAST ERROR LOG
+                jobQueue.publishLog(JSON.stringify({ type: 'error', msg }));
+                
                 await new Promise(r => setTimeout(r, 5000));
             }
         }
@@ -164,20 +171,35 @@ app.use((req, res, next) => {
 app.get('/healthz', (req, res) => res.status(200).json({ status: 'ok', uptime: process.uptime() }));
 app.get('/', (req, res) => res.status(200).send('OK')); 
 
+// --- NEW ENDPOINT: LOG STREAM (SSE) ---
+// This allows the Extension to listen to live logs
+app.get('/stream', async (req, res) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
+
+    // console.log('📡 Browser connected to Log Stream');
+
+    const logSub = await jobQueue.subscribeToLogs((message) => {
+        res.write(`data: ${message}\n\n`);
+    });
+
+    req.on('close', async () => {
+        await logSub.disconnect();
+    });
+});
+
 // --- API ROUTES ---
 
 app.post('/start', async (req, res) => {
     console.log('🚀 [API] Received START command');
 
     // --- 1. DYNAMIC INPUT NORMALIZATION ---
-    // Always convert inputs to Arrays, handling legacy single-item format
-
-    // Handle "Sessions" (Accounts)
     let sessions = [];
     if (Array.isArray(req.body.sessions) && req.body.sessions.length > 0) {
         sessions = req.body.sessions; 
     } else if (req.body.candidateId && req.body.authToken) {
-        // Fallback: Single account
         sessions.push({
             candidateId: req.body.candidateId,
             authToken: req.body.authToken,
@@ -185,12 +207,10 @@ app.post('/start', async (req, res) => {
         });
     }
 
-    // Handle "Combinations" (Jobs)
     let jobs = [];
     if (Array.isArray(req.body.combinations) && req.body.combinations.length > 0) {
         jobs = req.body.combinations;
     } else if (req.body.jobId && req.body.scheduleId) {
-        // Fallback: Single job
         jobs.push({
             jobId: req.body.jobId,
             scheduleId: req.body.scheduleId
@@ -205,15 +225,12 @@ app.post('/start', async (req, res) => {
         });
     }
 
-    // --- 3. GENERATE TASKS (Cross-Product) ---
+    // --- 3. GENERATE TASKS ---
     const allTasks = [];
-    
     for (const session of sessions) {
         if (!session.candidateId || !session.authToken) continue;
-
         for (const job of jobs) {
             if (!job.jobId || !job.scheduleId) continue;
-
             allTasks.push({
                 jobId: job.jobId,
                 scheduleId: job.scheduleId,
@@ -226,20 +243,13 @@ app.post('/start', async (req, res) => {
 
     // --- 4. DISTRIBUTE TO WORKERS ---
     if (allTasks.length > 0) {
-        // Push to Redis. All instances (including this one) will start grabbing tasks.
         await jobQueue.addTasks(allTasks);
-        
         console.log(`[Manager] Distributed ${allTasks.length} tasks.`);
-
         res.json({ 
             status: 'aws_batch_started', 
             message: `Swarm started. Distributed ${allTasks.length} tasks across the grid.`,
-            successful: 6, // Number of instances (static for now)
-            details: {
-                accounts: sessions.length,
-                jobs: jobs.length,
-                totalTasks: allTasks.length
-            }
+            successful: 6,
+            details: { accounts: sessions.length, jobs: jobs.length, totalTasks: allTasks.length }
         });
     } else {
         res.status(400).json({ status: 'failed', message: "No valid tasks could be generated." });
@@ -248,7 +258,6 @@ app.post('/start', async (req, res) => {
 
 app.post('/stop', async (req, res) => {
     console.log('🛑 [API] Received STOP command');
-    // Broadcast stop signal to ALL instances via Redis
     await jobQueue.broadcastStop();
     res.json({ status: 'stopped', message: 'Stop signal broadcasted' });
 });
@@ -270,10 +279,8 @@ async function start() {
     await rateLimiter.connect();
     await jobQueue.connect(); 
     
-    // 1. Start the Consumer Loop immediately
     startTaskConsumer();
 
-    // 2. Listen for GLOBAL Stop Signal
     jobQueue.onStop(() => {
         console.log(`[Event] 🛑 Stopping ${localWorkers.length} local workers`);
         localWorkers.forEach(w => w.stop());
