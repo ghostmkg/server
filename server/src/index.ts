@@ -1,7 +1,7 @@
 // filepath: server/src/index.ts
 import express from 'express';
 import cors from 'cors';
-// import fetch from 'node-fetch'; // REMOVED: Using Node 18 global fetch
+// import fetch from 'node-fetch'; // Using native fetch in Node 18+
 import { SessionStore } from './store/sessionStore';
 import { RateLimiter } from './rate/limiter';
 import { JobQueue } from './store/queue'; 
@@ -25,7 +25,6 @@ const rateLimiter = new RateLimiter(REDIS_URL, PER_ID_RPS, PER_ID_BURST, GLOBAL_
 const jobQueue = new JobQueue(REDIS_URL); 
 
 // --- WORKER CLASS ---
-// This class runs the actual job loop for a specific candidate + job combination
 class JobWorker {
     private active = true;
 
@@ -42,63 +41,94 @@ class JobWorker {
     async startLoop() {
         const domain = this.jobId.includes('JOB-US') ? 'hiring.amazon.com' : 'hiring.amazon.ca';
         
+        // --- PHASE 1: CREATE APPLICATION (Run Once) ---
+        let applicationId: string | null = null;
+
+        // Loop only until we successfully get an Application ID
+        while (this.active && !applicationId) {
+            applicationId = await this.createApplication(domain);
+            
+            if (!applicationId) {
+                // If creation failed (e.g. rate limit), wait before retrying
+                await new Promise(r => setTimeout(r, 5000));
+            }
+        }
+
+        // If stopped or failed to create, exit
+        if (!this.active || !applicationId) return;
+
+        console.log(`[Worker] 🔄 Entering Polling Loop for App ID: ${applicationId}`);
+
+        // --- PHASE 2: UPDATE LOOP (Poll Only) ---
         while (this.active) {
             try {
-                // 1. CREATE APPLICATION
-                const createRes = await fetch(`https://${domain}/application/api/candidate-application/ds/create-application/`, {
-                    method: 'POST',
-                    headers: {
-                        'content-type': 'application/json',
-                        'x-candidate-id': this.candidateId,
-                        'cookie': this.cookies,
-                        'authorization': this.authToken,
-                        'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                    },
-                    body: JSON.stringify({
-                        jobId: this.jobId,
-                        scheduleId: this.scheduleId,
-                        candidateId: this.candidateId,
-                        dspEnabled: true,
-                        activeApplicationCheckEnabled: true
-                    })
-                });
-
-                if (createRes.status === 200) {
-                    const data: any = await createRes.json();
-                    const appId = data.data?.applicationId;
+                // ONLY Call Update Application
+                const confirmed = await this.updateApplication(domain, applicationId);
+                
+                if (confirmed) {
+                    const successMsg = `🎉 Job Confirmed! Stopping worker for ${this.candidateId.slice(0,5)}`;
+                    console.log(`[Worker] ${successMsg}`);
+                    jobQueue.publishLog(JSON.stringify({ type: 'success', msg: successMsg }));
                     
-                    if (appId) {
-                        const msg = `✅ App Created: ${appId} for ${this.candidateId.slice(0,5)}`;
-                        console.log(`[Worker] ${msg}`);
-                        
-                        // 🔥 BROADCAST SUCCESS LOG
-                        jobQueue.publishLog(JSON.stringify({ type: 'success', msg }));
-
-                        // 2. UPDATE APPLICATION (Confirm)
-                        await this.updateApplication(domain, appId);
-                    }
-                } else if (createRes.status === 429) {
-                    await new Promise(r => setTimeout(r, 5000));
+                    this.active = false; // STOP THE LOOP
+                    return;
                 }
 
-                // Polling Interval + Jitter
+                // Wait before next poll
                 await new Promise(r => setTimeout(r, 2000 + Math.random() * 1500));
 
-            } catch (err: any) {
-                const msg = `❌ Error on ${this.candidateId.slice(0,5)}: ${err.message}`;
-                console.error(`[Worker] ${msg}`);
-                
-                // 🔥 BROADCAST ERROR LOG
-                jobQueue.publishLog(JSON.stringify({ type: 'error', msg }));
-                
+            } catch (err) {
                 await new Promise(r => setTimeout(r, 5000));
             }
         }
     }
 
-    async updateApplication(domain: string, applicationId: string) {
+    // Helper: Create Application (Returns ID or null)
+    async createApplication(domain: string): Promise<string | null> {
+        try {
+            const createRes = await fetch(`https://${domain}/application/api/candidate-application/ds/create-application/`, {
+                method: 'POST',
+                headers: {
+                    'content-type': 'application/json',
+                    'x-candidate-id': this.candidateId,
+                    'cookie': this.cookies,
+                    'authorization': this.authToken,
+                    'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                },
+                body: JSON.stringify({
+                    jobId: this.jobId,
+                    scheduleId: this.scheduleId,
+                    candidateId: this.candidateId,
+                    dspEnabled: true,
+                    activeApplicationCheckEnabled: true
+                })
+            });
+
+            if (createRes.status === 200) {
+                const data: any = await createRes.json();
+                const appId = data.data?.applicationId;
+                
+                if (appId) {
+                    const msg = `✅ App Created/Found: ${appId} for ${this.candidateId.slice(0,5)}`;
+                    console.log(`[Worker] ${msg}`);
+                    jobQueue.publishLog(JSON.stringify({ type: 'success', msg }));
+                    return appId;
+                }
+            } else if (createRes.status === 429) {
+                console.log(`[Worker] ⚠️ Create Rate Limit (429)`);
+            }
+        } catch (err: any) {
+            const msg = `❌ Create Error on ${this.candidateId.slice(0,5)}: ${err.message}`;
+            console.error(`[Worker] ${msg}`);
+            jobQueue.publishLog(JSON.stringify({ type: 'error', msg }));
+        }
+        return null;
+    }
+
+    // Helper: Update Application (Returns true if confirmed)
+    async updateApplication(domain: string, applicationId: string): Promise<boolean> {
          try {
-            await fetch(`https://${domain}/application/api/candidate-application/update-application`, {
+            const res = await fetch(`https://${domain}/application/api/candidate-application/update-application`, {
                 method: "PUT",
                 headers: {
                     'content-type': 'application/json',
@@ -113,7 +143,18 @@ class JobWorker {
                     type: "job-confirm", isCsRequest: true
                 })
             });
-         } catch(e) {}
+            
+            if (res.status === 200) {
+                const data: any = await res.json();
+                // If no errors, we assume success
+                if (!data.errors || data.errors.length === 0) {
+                    return true;
+                }
+            }
+            return false;
+         } catch(e) {
+            return false;
+         }
     }
 
     stop() {
@@ -125,12 +166,10 @@ class JobWorker {
 const localWorkers: JobWorker[] = [];
 
 // --- CONSUMER LOOP ---
-// Runs on EVERY instance. Checks Redis for work.
 async function startTaskConsumer() {
     console.log('👀 Worker Node started. Watching queue...');
     
     setInterval(async () => {
-        // Try to steal a task from Redis
         const taskData = await jobQueue.getNextTask();
         
         if (taskData) {
@@ -145,7 +184,7 @@ async function startTaskConsumer() {
             );
             localWorkers.push(worker);
         }
-    }, 1000); // Check every second
+    }, 1000); 
 }
 
 
@@ -171,21 +210,22 @@ app.use((req, res, next) => {
 app.get('/healthz', (req, res) => res.status(200).json({ status: 'ok', uptime: process.uptime() }));
 app.get('/', (req, res) => res.status(200).send('OK')); 
 
-// --- NEW ENDPOINT: LOG STREAM (SSE) ---
-// This allows the Extension to listen to live logs
+// --- LOG STREAM (Heartbeat) ---
 app.get('/stream', async (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders();
 
-    // console.log('📡 Browser connected to Log Stream');
+    res.write(': connected\n\n');
+    const heartbeat = setInterval(() => res.write(': heartbeat\n\n'), 25000);
 
     const logSub = await jobQueue.subscribeToLogs((message) => {
         res.write(`data: ${message}\n\n`);
     });
 
     req.on('close', async () => {
+        clearInterval(heartbeat);
         await logSub.disconnect();
     });
 });
@@ -195,7 +235,7 @@ app.get('/stream', async (req, res) => {
 app.post('/start', async (req, res) => {
     console.log('🚀 [API] Received START command');
 
-    // --- 1. DYNAMIC INPUT NORMALIZATION ---
+    // 1. INPUT NORMALIZATION
     let sessions = [];
     if (Array.isArray(req.body.sessions) && req.body.sessions.length > 0) {
         sessions = req.body.sessions; 
@@ -211,13 +251,10 @@ app.post('/start', async (req, res) => {
     if (Array.isArray(req.body.combinations) && req.body.combinations.length > 0) {
         jobs = req.body.combinations;
     } else if (req.body.jobId && req.body.scheduleId) {
-        jobs.push({
-            jobId: req.body.jobId,
-            scheduleId: req.body.scheduleId
-        });
+        jobs.push({ jobId: req.body.jobId, scheduleId: req.body.scheduleId });
     }
 
-    // --- 2. VALIDATION ---
+    // 2. VALIDATION
     if (sessions.length === 0 || jobs.length === 0) {
         return res.status(400).json({ 
             status: 'failed', 
@@ -225,10 +262,16 @@ app.post('/start', async (req, res) => {
         });
     }
 
-    // --- 3. GENERATE TASKS ---
+    // 3. GENERATE TASKS
     const allTasks = [];
+    let skippedSessions = 0;
+    
     for (const session of sessions) {
-        if (!session.candidateId || !session.authToken) continue;
+        if (!session.candidateId || !session.authToken) {
+            skippedSessions++;
+            continue;
+        }
+
         for (const job of jobs) {
             if (!job.jobId || !job.scheduleId) continue;
             allTasks.push({
@@ -241,18 +284,18 @@ app.post('/start', async (req, res) => {
         }
     }
 
-    // --- 4. DISTRIBUTE TO WORKERS ---
+    // 4. DISTRIBUTE
     if (allTasks.length > 0) {
         await jobQueue.addTasks(allTasks);
         console.log(`[Manager] Distributed ${allTasks.length} tasks.`);
         res.json({ 
             status: 'aws_batch_started', 
-            message: `Swarm started. Distributed ${allTasks.length} tasks across the grid.`,
+            message: `Swarm started. Distributed ${allTasks.length} tasks.`,
             successful: 6,
             details: { accounts: sessions.length, jobs: jobs.length, totalTasks: allTasks.length }
         });
     } else {
-        res.status(400).json({ status: 'failed', message: "No valid tasks could be generated." });
+        res.status(400).json({ status: 'failed', message: `No valid tasks generated. Skipped ${skippedSessions} invalid sessions.` });
     }
 });
 
@@ -272,7 +315,7 @@ app.use((err: Error, req: express.Request, res: express.Response, next: express.
   if (!res.headersSent) res.status(500).json({ error: 'internal_error', message: err.message });
 });
 
-// --- SETUP & START ---
+// --- START ---
 async function start() {
   try {
     await sessionStore.connect();
