@@ -72,8 +72,11 @@ class JobWorker {
                     return;
                 }
 
-                // Wait before next poll
-                await new Promise(r => setTimeout(r, 2000 + Math.random() * 1500));
+                // --- SPEED CONTROL ---
+                // 1800ms + random jitter. 
+                // With ~40 accounts across 6 instances (~7 per instance), 
+                // this yields approx 20-25 Global RPS safely.
+                await new Promise(r => setTimeout(r, 1800 + Math.random() * 400));
 
             } catch (err) {
                 await new Promise(r => setTimeout(r, 5000));
@@ -262,37 +265,47 @@ app.post('/start', async (req, res) => {
         });
     }
 
-    // 3. GENERATE TASKS
+    // 3. GENERATE TASKS (Round-Robin Logic)
+    // Instead of Cross-Product (Multiplication), we assign jobs cyclically.
     const allTasks = [];
     let skippedSessions = 0;
+    let jobIndex = 0;
     
     for (const session of sessions) {
+        // Validation: Ensure session has Auth
         if (!session.candidateId || !session.authToken) {
             skippedSessions++;
             continue;
         }
 
-        for (const job of jobs) {
-            if (!job.jobId || !job.scheduleId) continue;
-            allTasks.push({
-                jobId: job.jobId,
-                scheduleId: job.scheduleId,
-                candidateId: session.candidateId,
-                authToken: session.authToken,
-                cookieHeader: session.cookieHeader || ""
-            });
-        }
+        // Pick the next job in the list (Cycle back to 0 if we reach the end)
+        const job = jobs[jobIndex];
+        jobIndex = (jobIndex + 1) % jobs.length; // Rotate jobs
+
+        // Create exactly ONE task for this session
+        allTasks.push({
+            jobId: job.jobId,
+            scheduleId: job.scheduleId,
+            candidateId: session.candidateId,
+            authToken: session.authToken,
+            cookieHeader: session.cookieHeader || ""
+        });
     }
 
     // 4. DISTRIBUTE
     if (allTasks.length > 0) {
         await jobQueue.addTasks(allTasks);
-        console.log(`[Manager] Distributed ${allTasks.length} tasks.`);
+        console.log(`[Manager] Distributed ${allTasks.length} tasks (Round-Robin).`);
+        
         res.json({ 
             status: 'aws_batch_started', 
-            message: `Swarm started. Distributed ${allTasks.length} tasks.`,
+            message: `Swarm started. Assigned ${allTasks.length} accounts across ${jobs.length} jobs.`,
             successful: 6,
-            details: { accounts: sessions.length, jobs: jobs.length, totalTasks: allTasks.length }
+            details: { 
+                accounts: sessions.length, 
+                activeTasks: allTasks.length,
+                jobsRotated: jobs.length 
+            }
         });
     } else {
         res.status(400).json({ status: 'failed', message: `No valid tasks generated. Skipped ${skippedSessions} invalid sessions.` });
