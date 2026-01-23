@@ -44,17 +44,15 @@ class JobWorker {
         // --- PHASE 1: CREATE APPLICATION (Run Once) ---
         let applicationId: string | null = null;
 
-        // Loop only until we successfully get an Application ID
         while (this.active && !applicationId) {
             applicationId = await this.createApplication(domain);
             
             if (!applicationId) {
-                // If creation failed (e.g. rate limit), wait before retrying
+                // If creation failed, wait before retrying
                 await new Promise(r => setTimeout(r, 5000));
             }
         }
 
-        // If stopped or failed to create, exit
         if (!this.active || !applicationId) return;
 
         console.log(`[Worker] 🔄 Entering Polling Loop for App ID: ${applicationId}`);
@@ -83,7 +81,7 @@ class JobWorker {
         }
     }
 
-    // Helper: Create Application (Returns ID or null)
+    // Helper: Create Application
     async createApplication(domain: string): Promise<string | null> {
         try {
             const createRes = await fetch(`https://${domain}/application/api/candidate-application/ds/create-application/`, {
@@ -104,28 +102,27 @@ class JobWorker {
                 })
             });
 
+            // --- LOGGING REQUEST STATUS ---
+            console.log(`[Worker] 🟡 create-application (${createRes.status})`);
+
             if (createRes.status === 200) {
                 const data: any = await createRes.json();
                 const appId = data.data?.applicationId;
                 
                 if (appId) {
-                    const msg = `✅ App Created/Found: ${appId} for ${this.candidateId.slice(0,5)}`;
+                    const msg = `✅ App Created/Found: ${appId}`;
                     console.log(`[Worker] ${msg}`);
                     jobQueue.publishLog(JSON.stringify({ type: 'success', msg }));
                     return appId;
                 }
-            } else if (createRes.status === 429) {
-                console.log(`[Worker] ⚠️ Create Rate Limit (429)`);
-            }
+            } 
         } catch (err: any) {
-            const msg = `❌ Create Error on ${this.candidateId.slice(0,5)}: ${err.message}`;
-            console.error(`[Worker] ${msg}`);
-            jobQueue.publishLog(JSON.stringify({ type: 'error', msg }));
+            console.log(`[Worker] ❌ create-application Error: ${err.message}`);
         }
         return null;
     }
 
-    // Helper: Update Application (Returns true if confirmed)
+    // Helper: Update Application
     async updateApplication(domain: string, applicationId: string): Promise<boolean> {
          try {
             const res = await fetch(`https://${domain}/application/api/candidate-application/update-application`, {
@@ -144,15 +141,18 @@ class JobWorker {
                 })
             });
             
+            // --- LOGGING REQUEST STATUS ---
+            console.log(`[Worker] 🔵 update-application (${res.status})`);
+
             if (res.status === 200) {
                 const data: any = await res.json();
-                // If no errors, we assume success
                 if (!data.errors || data.errors.length === 0) {
                     return true;
                 }
             }
             return false;
-         } catch(e) {
+         } catch(e: any) {
+            console.log(`[Worker] ❌ update-application Error: ${e.message}`);
             return false;
          }
     }
@@ -162,7 +162,7 @@ class JobWorker {
     }
 }
 
-// Local array to track what THIS specific instance is running
+// Local array
 const localWorkers: JobWorker[] = [];
 
 // --- CONSUMER LOOP ---
